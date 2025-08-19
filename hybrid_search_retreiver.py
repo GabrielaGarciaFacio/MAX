@@ -16,6 +16,7 @@
 # """
 # # general purpose imports
 import traceback
+import requests
 import logging
 import datetime
 from typing import Union
@@ -116,22 +117,7 @@ class HybridSearchRetriever:
         if self._pinecone is None:
             self._pinecone = PineconeIndex()
         return self._pinecone
-    '''
-    # prompting wrapper
-    @property
-    def chat(self) -> ChatOpenAI:
-        """ChatOpenAI lazy read-only property."""
-        if self._chat is None:
-            self._chat = ChatOpenAI(
-                api_key=settings.openai_api_key.get_secret_value(),  # pylint: disable=no-member
-                organization=settings.openai_api_organization,
-                cache=settings.openai_chat_cache,
-                max_retries=settings.openai_chat_max_retries,
-                model=settings.openai_chat_model_name,
-                temperature=settings.openai_chat_temperature,
-            )
-        return self._chat
-'''
+    
     @property
     def chat(self)->ChatOpenAI:
         if self._chat is None:
@@ -152,21 +138,7 @@ class HybridSearchRetriever:
         if self._b25_encoder is None:
             self._b25_encoder = BM25Encoder().default()
         return self._b25_encoder
-    """
-    #@property
-    def retriever(self, namespace="Cursos") -> PineconeHybridSearchRetriever:
-        #PineconeHybridSearchRetriever lazy read-only property.
-        if self._retriever is None:
-            self._retriever = PineconeHybridSearchRetriever(
-                embeddings=self.pinecone.openai_embeddings, 
-                sparse_encoder=self.bm25_encoder, 
-                index=self.pinecone.index,
-                top_k=60,
-                alpha=0.9,
-                namespace=namespace)
-        
-        return self._retriever
-    """
+   
     # def retriever(self, namespace="Cursos", top_k=40) -> PineconeHybridSearchRetriever:
     #     return PineconeHybridSearchRetriever(
     #         embeddings=self.pinecone.openai_embeddings,
@@ -183,7 +155,12 @@ class HybridSearchRetriever:
         # Analizar el tipo de consulta si se proporciona
         if query:
             query_lower = query.lower()
-            
+            #Detectar consultas que solicitan MÚLTIPLES cursos
+            multiple_course_indicators = [
+                "cursos", "opciones", "alternativas", "que tienes", "que hay", 
+                "qué cursos", "cuáles", "todos los", "lista de", "catálogo"
+            ]
+            is_multiple_request= any(indicator in query_lower for indicator in multiple_course_indicators)
             # Detectar consultas específicas (necesitan más precisión textual)
             specific_indicators = [
                 "clave", "precio de", "costo de", "temario de", "laboratorio de", 
@@ -202,18 +179,27 @@ class HybridSearchRetriever:
             is_price_query = any(word in query_lower for word in ["precio", "costo", "cost", "$"])
             
             # Ajustar parámetros dinámicamente
-            if is_specific or is_price_query:
+            if is_multiple_request and not is_specific:
                 # Para consultas específicas: más peso a búsqueda textual exacta
-                alpha = 0.3
-                top_k_dynamic = 10
-            elif is_tech_specific:
+                alpha = 0.6
+                top_k_dynamic = 50
+            elif is_specific and not is_multiple_request:
                 # Para términos técnicos específicos: balance equilibrado
-                alpha = 0.5
+                alpha = 0.3
                 top_k_dynamic = 15
+            elif is_tech_specific and is_multiple_request:
+                alpha=.5
+                top_k_dynamic=40
+            elif is_price_query:
+                alpha=.3
+                top_k_dynamic=20
+            elif is_tech_specific:
+                alpha=.5
+                top_k_dynamic=25
             else:
                 # Para consultas generales: más peso a embeddings semánticos
                 alpha = 0.7
-                top_k_dynamic = 25
+                top_k_dynamic = 35
         else:
             # Valores por defecto balanceados
             alpha = 0.6
@@ -246,9 +232,6 @@ class HybridSearchRetriever:
             human_message = HumanMessage(content=str(human_message))
         
         messages = [SystemMessage(content=f"{self.format_history()}"),system_message, human_message]
-        #print(f"\n\n---------------------------------------------MESSAGES----------------------------------------------------") #DEBUGGING
-        #print(f"messagess: {messages}") #DEBUGGING
-        #print("---------------------------------------------FIN MESSAGES-----------------------------------------------\n\n") #DEBUGGING
         response_content = ""
         if self.chat.stream:
             logging.debug("Chat en modo de transmisión")
@@ -258,10 +241,6 @@ class HybridSearchRetriever:
                     delta = chunk['choices'][0].get('delta', {}).get('content', '')
                     if delta:  # Solo agrega si el contenido no está vacío 
                         response_content += delta
-                        #logging.debug(f"Received chunk: {delta}")
-            #print(f"\n\n---------------------------------------------DELTA----------------------------------------------------") #DEBUGGING
-            #print(f"Delta: {delta}") #DEBUGGING
-            #print("---------------------------------------------FIN DELTA-----------------------------------------------\n\n") #DEBUGGING
             return HumanMessage(content=response_content)
         else:
             # Manejo de respuesta no transmitida
@@ -392,21 +371,30 @@ class HybridSearchRetriever:
             i += 1
             j = len(pdf_links)
             pdf_url = pdf_link[0]
-            complete_url = "https://sce.netec.com/" + pdf_url                        
-            loader = PyPDFLoader(file_path=complete_url)
-            docs = loader.load()
-            k = 0
+            complete_url = "https://sce.netec.com/" + pdf_url  
+
+            try:
+            #Verificamos si el PDF existe antes de cargarlo
+                response= requests.head(complete_url)
+                if response.status_code != 200:
+                    print(f"⚠️ PDF no encontrado ({response.status_code}): {complete_url}")
+                    continue
+                #cargar PDF
+                                
+                loader = PyPDFLoader(file_path=complete_url)
+                docs = loader.load()
+                k = 0
             
-            for doc in docs:
-                k += 1
-                print(k * "-", end="\r")
-                documents = self.pinecone.text_splitter.create_documents([doc.page_content])
-                document_texts = [doc.page_content for doc in documents]
-                embeddings = self.pinecone.openai_embeddings.embed_documents(document_texts)
-                self.pinecone.vector_store.add_documents(documents=documents, embeddings=embeddings, namespace="Temarios")
-
-        #print("Finished loading PDFs. \n" + self.pinecone.index_stats)
-
+                for doc in docs:
+                    k += 1
+                    print(k * "-", end="\r")
+                    documents = self.pinecone.text_splitter.create_documents([doc.page_content])
+                    document_texts = [doc.page_content for doc in documents]
+                    embeddings = self.pinecone.openai_embeddings.embed_documents(document_texts)
+                    self.pinecone.vector_store.add_documents(documents=documents, embeddings=embeddings, namespace="Temarios")
+            except Exception as e:
+                print(f'Error al procesar {complete_url}:{e}')
+                continue
  
     def extract_data_from_lc_id(self, lc_id_value,namespace="Cursos"):
         print("Ejecutando extract_data_from_lc_id...")  # Debugging básico
@@ -800,13 +788,89 @@ WHERE
         Retrieval Augmented Generation prompt simplificado.
         Toda la información de laboratorios y exámenes ya está en el namespace 'Cursos'
         """
+        # Función temporal para debugging - agregar al método rag() antes de format_response()
+
+        def debug_curso_data(data, doc_metadata=None):
+            """
+            Función temporal para debugging de datos de curso
+            """
+            print("="*50)
+            print("DEBUG - DATOS DEL CURSO")
+            print("="*50)
+            
+            if isinstance(data, dict):
+                print(f"Clave: {data.get('clave', 'NO_FOUND')}")
+                print(f"Nombre: {data.get('nombre', 'NO_FOUND')}")
+                print(f"Subcontratado (campo): {data.get('subcontratado', 'NO_FOUND')} - Tipo: {type(data.get('subcontratado'))}")
+                
+                # Verificar patrones en la clave
+                clave = data.get('clave', '')
+                patrones_encontrados = []
+                patrones_sub = ['(sub)', '(SUB)', '(Sub)', '(sub-ext)', '(SUB-EXT)', '(Sub-Ext)']
+                
+                for patron in patrones_sub:
+                    if patron.lower() in clave.lower():
+                        patrones_encontrados.append(patron)
+                
+                print(f"Patrones Sub encontrados en clave: {patrones_encontrados}")
+                print(f"Todos los campos disponibles: {list(data.keys())}")
+            
+            if doc_metadata:
+                print("\nDEBUG - METADATA DEL DOCUMENTO")
+                print(f"Metadata subcontratado: {doc_metadata.get('subcontratado', 'NO_FOUND')}")
+                print(f"Metadata lc_id: {doc_metadata.get('lc_id', 'NO_FOUND')}")
+            
+            print("="*50)
+
         try:                
             def format_response(data):
                 """
                 Función que genera respuestas amigables con formato limpio (SIN bloques de código)
+                Con plantilla especial para cursos subcontratados
                 """
                 if not isinstance(data, dict):
+                    print('ERROR: data no es un diccionario')
                     return "Error: Datos de curso no válidos"
+                    # DEBUGGING DETALLADO
+                clave_curso = data.get('clave', '')
+                subcontratado_field = data.get('subcontratado', 'No')
+                
+                print(f"\n--- FORMAT_RESPONSE DEBUG ---")
+                print(f"Clave: {clave_curso}")
+                print(f"Subcontratado field: '{subcontratado_field}' (tipo: {type(subcontratado_field)})")
+                
+                # Verificación por clave
+                patrones_sub = ['(sub)', '(SUB)', '(Sub)', '(sub-ext)', '(SUB-EXT)', '(Sub-Ext)']
+                clave_indica_sub = any(patron.lower() in clave_curso.lower() for patron in patrones_sub)
+                print(f"Clave indica sub: {clave_indica_sub}")
+                
+                # Verificación por campo
+                if isinstance(subcontratado_field, str):
+                    subcontratado_normalized = subcontratado_field.strip().lower()
+                else:
+                    subcontratado_normalized = str(subcontratado_field).strip().lower()
+                
+                valores_subcontratado = ['si', 'sí', 'yes', '1', 'true', 'verdadero']
+                campo_indica_sub = (
+                    subcontratado_normalized in valores_subcontratado or
+                    subcontratado_field in [1, True, '1'] or
+                    (isinstance(subcontratado_field, (int, bool)) and subcontratado_field)
+                )
+                print(f"Campo indica sub: {campo_indica_sub}")
+                
+                is_subcontratado = campo_indica_sub or clave_indica_sub
+                print(f"DECISION FINAL - Es subcontratado: {is_subcontratado}")
+                print(f"--- END FORMAT_RESPONSE DEBUG ---\n")
+                
+                if is_subcontratado:
+                    print("RETORNANDO PLANTILLA SUBCONTRATADO")
+                    return f"""**Curso Subcontratado**
+            - **Clave**: {data.get('clave', 'NA')}
+            - **Nombre**: {data.get('nombre', 'NA')}
+            - **Más información**: [Subcontrataciones](https://netec.sharepoint.com/Subcontrataciones/subcontratacioneslatam/SitePages/Inicio.aspx)"""
+                
+                print("RETORNANDO PLANTILLA COMPLETA")
+                # Si no es subcontratado, continuar con la plantilla completa
                 
                 # Procesar link del temario
                 link_temario = data.get('link_temario', 'Temario no encontrado')
@@ -827,14 +891,14 @@ WHERE
                 # Determinar si tiene laboratorio basado en los datos del curso
                 if (tipo_elemento == 'Equipo' and 
                     nombre_examen and nombre_examen.lower().startswith('laboratorio')):
-                    labs_info = f"Sí\n  - Nombre: {clave_examen} [- Costo: {costo}"
+                    labs_info = f"Sí\n  - Nombre: {clave_examen} - Costo: {costo}"
                 else:
                     labs_info = "No lleva laboratorio"
                 
                 # Determinar si tiene examen de certificación basado en los datos del curso
                 if (tipo_elemento == 'Examen' and 
                     nombre_examen == 'certificación'):
-                    examenes_info = f"Sí\n  - Nombre: {clave_examen} [- Costo: {costo}"
+                    examenes_info = f"Sí\n  - Nombre: {clave_examen} - Costo: {costo}"
                 else:
                     examenes_info = "No tiene certificación asociada"
                 
@@ -863,7 +927,6 @@ WHERE
             - **Link al temario**: {link_temario}"""
                 
                 return template
-
             if not isinstance(human_message, HumanMessage):
                 logging.debug("Converting human_message to HumanMessage")
                 human_message = HumanMessage(content=str(human_message))
@@ -941,17 +1004,32 @@ WHERE
                 # Eliminar símbolos de puntuación usando una expresión regular
                 query = re.sub(r'[¿?¡!]', '', query)  # Elimina los símbolos especificados
                 # Lista de palabras que no aportan valor a la búsqueda
-                stop_words = ["agnóstico","agnostico", "tenemos", "tienes", "tiene", "de", "a", "los", "curso", "cursos", "hay", "algún", "alguna", "precio", "presupuesto", "y", "para", "que", "en", "el", "catalogo", "catalogo?", "cubran", "cubra", "puedo", "ofrecer", "cliente", "quiere", "conocer", "principales", "principal", "elemento", "elementos", "un", "digital"]
+                stop_words = [
+                    "agnóstico", "agnostico", "tenemos", "tienes", "tiene", "de", "a", "los", 
+                    "hay", "algún", "alguna", "y", "para", "en", "el", "catalogo", "catalogo?", 
+                    "cubran", "cubra", "puedo", "ofrecer", "cliente", "quiere", "conocer", 
+                    "principales", "principal", "elemento", "elementos", "un", "digital"
+                ]
+                words=query.lower().split()
+                clened_words=[]
+                for word in words:
+                    if word and word.strip() and word not in stop_words:
+                        clened_words.append(word.strip())
                 # Divide la consulta en palabras y elimina las stop words
-                cleaned_queryes = " ".join([word for word in query.lower().split() if word not in stop_words])
-                # Traducción de la consulta limpia al inglés
-                cleaned_queryen = translate_with_mymemory(cleaned_queryes)
-                # Devuelve la consulta limpia en español y su traducción en inglés
-                if cleaned_queryes.strip() == cleaned_queryen.strip():
+                cleaned_queryes = " ".join(clened_words)
+                if not cleaned_queryes.strip():
+                    return query.strip()
+                try:
+                    cleaned_queryen= translate_with_mymemory(cleaned_queryes)
+                except Exception as e:
+                    print(f'Error en traducción:{e}')
+                    cleaned_queryen=cleaned_queryes
+                
+                #devolver la consulta combinada
+                if cleaned_queryes.strip()==cleaned_queryen.strip():
                     return cleaned_queryes
                 else:
-                    return f"{cleaned_queryes} {cleaned_queryen}"
-            
+                    return f'{cleaned_queryes}{cleaned_queryen}'
             def get_unified_leader_prompt(intencion):
                 """
                 Función que genera prompts unificados manteniendo las instrucciones específicas de cada intención 
@@ -961,14 +1039,11 @@ WHERE
                 TEMPLATE_OBLIGATORIA = """
             **FORMATO OBLIGATORIO PARA CADA CURSO - USAR EXACTAMENTE COMO SE MUESTRA:**
             
-            Para cada curso debes seguir esta estructura OBLIGATORIA:
-            1. **Nombre del Curso [CLAVE]** (en negritas)
+            Para cada curso que no sea subcontratado, debes seguir esta estructura OBLIGATORIA:
+            1. Descripción detallada del curso basada en el temario (mínimo 150 palabras)
+            2. Información estructurada del curso usando la plantilla
 
-            2. **RESUMEN DEL TEMARIO** (OBLIGATORIO- mínimo 150 palabras)
-
-            3. **PLANTILLA DEL CURSO** (OBLIGATORIA):
-
-            **Curso**
+            **Plantilla del curso**
             - **Clave**: [valor]
             - **Nombre**: [valor] V[versión]
             - **Tecnología/ Línea de negocio**: [valor] / [valor]
@@ -985,8 +1060,9 @@ WHERE
 
             REGLAS CRÍTICAS:
             - SIEMPRE responde de forma amable y conversacional ANTES de mostrar la información del curso
-            - USA EXACTAMENTE esta plantilla para cada curso (SIN bloques de código ``` ```)
+            - USA EXACTAMENTE esta plantilla para cada curso que no sea subcontratado (SIN bloques de código ``` ```)
             - NO pongas la plantilla dentro de bloques de código
+            - NO uses títulos como "RESUMEN DEL TEMARIO" o "PLANTILLA DEL CURSO"
             - Formatea la respuesta de manera limpia y legible
             - NO cambies el orden de los campos
             - NO omitas ningún campo
@@ -1074,7 +1150,7 @@ WHERE
             - Si existen varios cursos con clave similar: incluye TODOS usando la plantilla completa (ej: CCNA, CCNA Digital, CCNA Digital-CLC)
             - Para temas desconocidos: "Disculpa, no tengo esta información. Favor de contactar a un Ing. Preventa"
             - Haz resúmenes usando **Temarios** (mínimo 150 palabras por curso)
-            - Formato: nombre del curso y clave en negritas, seguido del resumen, luego la plantilla completa del curso
+            
             """,
                     
                     "Laboratorio": """
@@ -1135,6 +1211,44 @@ WHERE
                 #documents = self.retriever(namespace=namespace).get_relevant_documents(query=enhanced_query)
                 documents = self.retriever(namespace=namespace, query=enhanced_query).get_relevant_documents(query=enhanced_query)
                 print(f"Documentos recuperados en {namespace}: {len(documents)}")
+                
+                print("="*60)
+                print("DEBUGGING CLASIFICACIÓN DE CURSOS")
+                print("="*60)
+
+                for i, doc in enumerate(documents):
+                    try:
+                        if hasattr(doc, 'metadata') and isinstance(doc.metadata, dict):
+                            lc_id = doc.metadata.get('lc_id', 'Sin lc_id')
+                            subcontratado_meta = doc.metadata.get('subcontratado', 'Sin dato')
+                        else:
+                            lc_id="No metadata"
+                            subcontratado_meta="No metadata"
+                            # Extraer datos para ver la clave
+                            try:
+                                data = self.extract_data_from_lc_id(lc_id, namespace="Cursos")
+                                if isinstance(data,dict):
+                                    clave = data.get('clave', 'Sin clave')
+                                    subcontratado_data = data.get('subcontratado', 'Sin dato')
+                                    
+                                    print(f"\nDOC {i+1}:")
+                                    print(f"  Clave: {clave}")
+                                    print(f"  Subcontratado (metadata): {subcontratado_meta}")
+                                    print(f"  Subcontratado (data): {subcontratado_data}")
+                                    print(f"  Tiene (Sub) en clave: {'(sub)' in clave.lower() or '(SUB)' in clave}")
+                                    
+                                    tiene_sub_patron = any(patron in clave.upper() for patron in [' (SUB)', ' (SUB-EXT)',' (Sub) (Digital)',' (Sub-Ext)',' (sub)',' (Sub)'])
+                                    print(f"  Tiene (Sub) en clave: {tiene_sub_patron}")
+                                else:
+                                    print(f"\nDOC {i+1}: Error - extract_data_from_lc_id no devolvió diccionario")
+                                    
+                            except Exception as e:
+                                print(f"\nDOC {i+1}: Error al extraer datos - {e}")
+                    except Exception as e:
+                                print(f"\nDOC {i+1}: Error al extraer datos - {e}")
+
+                print("="*60)
+
 
                 def safe_get_metadata(doc, key, default=None):
                     """Función auxiliar mejorada para acceder de forma segura a los metadatos"""
@@ -1152,6 +1266,7 @@ WHERE
                     except Exception as e:
                         print(f"Error accediendo a metadata '{key}': {e}")
                         return default
+                
                 
                 def safe_int_conversion(value, default=0):
                     """Conversión segura a entero"""
@@ -1279,6 +1394,7 @@ WHERE
                             continue
                             
                         data = self.extract_data_from_lc_id(lc_id, namespace="Cursos")
+                        debug_curso_data(data,doc.metadata)
                         
                         if not isinstance(data, dict):
                             print(f"Error: extract_data_from_lc_id no devolvió un diccionario válido para {lc_id}")
@@ -1296,18 +1412,32 @@ WHERE
 
             # Procesar cursos subcontratados - SIMPLIFICADO
             if sorted_subcontracted_courses:
+                print("\n" + "="*50)
+                print("PROCESANDO CURSOS SUBCONTRATADOS")
+                print("="*50)
+                
                 formatted_documents.append("\n**En otras modalidades de entrega te ofrecemos:**")
-                for doc in sorted_subcontracted_courses:
+                for i, doc in enumerate(sorted_subcontracted_courses):
                     if hasattr(doc, "metadata") and isinstance(doc.metadata, dict):
                         try:
-                            data = self.extract_data_from_lc_id(doc.metadata.get('lc_id', ''), namespace="Cursos")
+                            lc_id = doc.metadata.get('lc_id', '')
+                            print(f"\nSUBCONTRATADO {i+1}:")
+                            print(f"  lc_id: {lc_id}")
                             
-                            # SIMPLIFICADO: Ya no buscamos labs_data y examenes_data por separado
-                            formatted_documents.append(format_response(data))
+                            data = self.extract_data_from_lc_id(lc_id, namespace="Cursos")
+                            print(f"  Data extraída: {isinstance(data, dict)}")
+                            
+                            if isinstance(data, dict):
+                                print(f"  Clave: {data.get('clave', 'NA')}")
+                                print(f"  Subcontratado: {data.get('subcontratado', 'NA')}")
+                                print(f"  Tipo subcontratado: {type(data.get('subcontratado'))}")
+                            
+                            formatted_response = format_response(data)
+                            print(f"  Respuesta generada (primeros 100 chars): {formatted_response[:100]}...")
+                            formatted_documents.append(formatted_response)
 
                         except Exception as e:
-                            print(f"Error procesando curso subcontratado: {e}")
-
+                            print(f"Error procesando curso subcontratado {i+1}: {e}")
             # Armado seguro del system_message_content
             system_message_content = f"{leader}{'. '.join(str(doc) for doc in formatted_documents)}"
             system_message = SystemMessage(content=system_message_content)
