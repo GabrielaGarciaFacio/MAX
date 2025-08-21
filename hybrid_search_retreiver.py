@@ -395,6 +395,16 @@ class HybridSearchRetriever:
             except Exception as e:
                 print(f'Error al procesar {complete_url}:{e}')
                 continue
+    #Función para detectar idioma basado en la clave
+    def detect_language_from_key(self, clave):
+        """
+        Detecta el idioma del curso basado en la clave.
+        Si contiene 'ESP' es español, si no es inglés-
+        """
+        if isinstance(clave,str) and 'ESP' in clave.upper():
+            return "Español"
+        return "Inglés"
+
  
     def extract_data_from_lc_id(self, lc_id_value,namespace="Cursos"):
         print("Ejecutando extract_data_from_lc_id...")  # Debugging básico
@@ -417,6 +427,13 @@ class HybridSearchRetriever:
          
         values.extend(['NA'] * (len(keys) - len(values)))
         extracted_data=dict(zip(keys,values))
+        #Detectar idioma basado en la clave
+        clave_curso=extracted_data.get("clave","").strip()
+        idioma=self.detect_language_from_key(clave_curso)
+        extracted_data["idioma"]=idioma
+        print(f'Clve del curso:{clave_curso}')
+        print(f'Idioma detectado:{idioma}')
+
         link_temario_value = extracted_data.get("link_temario", "").strip()        
         encoded_url = 'Temario no encontrado'
                 
@@ -456,6 +473,7 @@ class HybridSearchRetriever:
             "base_costo":values[23].strip() if len (values)>23 else 'NA',
             "pais":values[24].strip() if len (values)>24 else 'NA',
             "costo":values[25].strip() if len (values)>25 else 'NA',
+            "idioma":idioma
         }
         
 
@@ -763,6 +781,7 @@ WHERE
         Responde solo con "Agnostico" si la consulta hace referencia a la palabra agnostico o alguna de sus variantes o conjugaciones.
         Responde solo con "Temarios" si el mensaje pregunta especí­ficamente por el temario, contenido, de que trata uno o mas cursos.
         Responde solo con "Recomendacion" si el mensaje solicita algún curso para cubrir algún tema o grupo de temas, por ejempo ("Cursos de administración de proyectos y agile")
+        Responde solo con "Idioma" si la consulta pregunta específicamente por el idioma de un curso o cursos, incluyendo preguntas como "¿en qué idioma está?", "¿está en español?", "¿hay en inglés?", "idioma del curso", etc.
         Responde solo con "No" si la consulta no tiene relación con estos temas, si es demasiado general para determinar una intención específica o si no se cuenta con la información.
         Responde solo con "Laborarorio" si la consulta solicita información correspondiente a los laboratorios de los cursos (por ejemplo, precio, disponibilidad, país, clave, nombre)
         Responde solo con "Examenes" si la consulta solicita información correspondiente a los exámenes de los cursos (por ejemplo, precio, disponibilidad, país, clave, nombre)
@@ -782,6 +801,28 @@ WHERE
         # Extrae la intenciÃ³n
         intencion = respuesta.content.strip()
         return intencion
+    def format_language_response(self, data, query=""):
+        """
+        Función específica para responder consultas sobre idioma de cursos
+        Respuesta concisa y directa sin plantilla completa
+        """
+        if not isinstance(data, dict):
+            return "Error: No puedo determinar el idioma del curso"
+        
+        clave_curso = data.get('clave', 'NA')
+        nombre_curso = data.get('nombre', 'NA')
+        idioma_curso = data.get('idioma', 'Inglés')
+        
+        # Detectar si pregunta por curso específico o múltiples cursos
+        query_lower = query.lower()
+        
+        # Si es una consulta específica sobre un curso
+        if any(indicator in query_lower for indicator in ['el curso', 'este curso', clave_curso.lower()]):
+            return f"El curso **{clave_curso}** ({nombre_curso}) está disponible en **{idioma_curso}**."
+        
+        # Si es una consulta más general
+        return f"**{clave_curso}** - {nombre_curso}: **{idioma_curso}**"
+
 
     def rag(self, human_message: Union[str, HumanMessage], conversation_history=None):
         """
@@ -806,7 +847,7 @@ WHERE
                 # Verificar patrones en la clave
                 clave = data.get('clave', '')
                 patrones_encontrados = []
-                patrones_sub = ['(sub)', '(SUB)', '(Sub)', '(sub-ext)', '(SUB-EXT)', '(Sub-Ext)']
+                patrones_sub = [' (Sub-Ext)',' (Sub) (Digital)', ' (Sub)', '(Sub-Ext)','(Sub) (Digital)', '(Sub)']
                 
                 for patron in patrones_sub:
                     if patron.lower() in clave.lower():
@@ -827,6 +868,7 @@ WHERE
                 """
                 Función que genera respuestas amigables con formato limpio (SIN bloques de código)
                 Con plantilla especial para cursos subcontratados
+                Incluye el idioma del curso
                 """
                 if not isinstance(data, dict):
                     print('ERROR: data no es un diccionario')
@@ -834,6 +876,7 @@ WHERE
                     # DEBUGGING DETALLADO
                 clave_curso = data.get('clave', '')
                 subcontratado_field = data.get('subcontratado', 'No')
+                idioma_curso=data.get('idioma','Inglés') #Obtener idioma
                 
                 print(f"\n--- FORMAT_RESPONSE DEBUG ---")
                 print(f"Clave: {clave_curso}")
@@ -916,6 +959,7 @@ WHERE
             - **Nombre**: {data.get('nombre', 'NA')} V{data.get('version', 'NA')}
             - **Tecnología/ Línea de negocio**: {data.get('tecnologia_id', 'NA')} / {data.get('linea_negocio_id', 'NA')}
             - **Entrega**: {data.get('entrega', 'NA')}
+            - **Idioma**: {idioma_curso}
             - **Estatus del curso**: {disponibilidad}
             - **Tipo de curso**: {data.get('tipo_curso_id', 'NA')}
             - **Sesiones y Horas**: {data.get('sesiones', 'NA')} / {data.get('horas', 'NA')}
@@ -1048,6 +1092,7 @@ WHERE
             - **Nombre**: [valor] V[versión]
             - **Tecnología/ Línea de negocio**: [valor] / [valor]
             - **Entrega**: [valor]
+            - **Idioma**: [Español/Inglés - detectado automáticamente por la clave]
             - **Estatus del curso**: [valor]
             - **Tipo de curso**: [valor]
             - **Sesiones y Horas**: [valor] / [valor]
@@ -1061,6 +1106,7 @@ WHERE
             REGLAS CRÍTICAS:
             - SIEMPRE responde de forma amable y conversacional ANTES de mostrar la información del curso
             - USA EXACTAMENTE esta plantilla para cada curso que no sea subcontratado (SIN bloques de código ``` ```)
+            - El campo **Idioma** se detecta automáticamente: si la clave contiene 'ESP' es Español, si no es Inglés
             - NO pongas la plantilla dentro de bloques de código
             - NO uses títulos como "RESUMEN DEL TEMARIO" o "PLANTILLA DEL CURSO"
             - Formatea la respuesta de manera limpia y legible
@@ -1077,12 +1123,24 @@ WHERE
             - Usas un tono conversacional y cálido
             - Explicas de manera clara y comprensible
             - Siempre buscas ayudar al máximo
+            - También informas sobre el idioma de los cursos basándote en su clave
 
             {TEMPLATE_OBLIGATORIA}
             """
 
                 # INSTRUCCIONES ESPECÍFICAS POR INTENCIÓN
                 specific_instructions = {
+                    "Idioma":"""
+            **Instrucciones para consultas sobre IDIOMA**
+            - SIEMPRE responde de forma amable : ¡Por supuesto! Te comparto la información del idioma:
+            - Para consultas específicas sobre un curso: "El curso [CLAVE] ([NOMBRE]) está disponible en [IDIOMA]."
+            - Para múltiples cursos: mostrar lista concisa: "[CLAVE] - [NOMBRE]: [IDIOMA]"
+            - NO uses la plantilla completa del curso, sólo responde la información del idioma solicitada
+            - Si preguntan por cursos en español específicamente: filta y muestra sólo los que contengan 'ESP' en la clave
+            - Si preguntan por cursos en inglés: muestra los que NO contengan 'ESP' en la clave
+            - Mantén un tono conversacional y amable
+            
+            """,
                     "Certificaciones": """
             **Instrucciones para CERTIFICACIONES**:
             - Si la consulta incluye términos como "certificación" o "certificaciones", muestra SÓLO la lista de certificaciones disponibles
