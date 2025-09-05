@@ -172,7 +172,6 @@ SELECT DISTINCT
         AND Ch.clave IS NOT NULL 
         AND Ch.clave != ''
         AND LTRIM(RTRIM(Ch.clave)) != ''
-        AND Ch.clave LIKE '%AWS%'
 
     GROUP BY 
         Ch.Clave,
@@ -667,3 +666,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
