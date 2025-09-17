@@ -11,6 +11,15 @@ import re
 import pyodbc
 import requests
 from PyPDF2 import PdfReader
+import time
+from openai import OpenAI as OpenAIClient
+from dotenv import load_dotenv
+
+# Cargar variables de entorno
+load_dotenv()
+
+OPENAI_API_KEY="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"
+OPENAI_RESPONSES_MODEL = os.getenv("OPENAI_RESPONSES_MODEL", "gpt-5-nano")
 
 # =========================
 # Config SQL (no cambia)
@@ -269,6 +278,242 @@ def dedupe_temarios_por_clave(rows):
             if not actual.get("nombre") and r.get("nombre"):
                 actual["nombre"] = r.get("nombre")
     return list(por_clave.values())
+
+def _is_cisco_record(rec: dict) -> bool:
+    """
+    Verdadero si 'cisco' aparece en CUALQUIER clave o valor del registro.
+    (insensible a mayúsculas/acentos básicos)
+    """
+    try:
+        # volvemos todo a un texto unificado
+        blob = json.dumps(rec, ensure_ascii=False)
+        return "cisco" in blob.lower()
+    except Exception:
+        # fallback conservador
+        for k, v in rec.items():
+            if ("cisco" in str(k).lower()) or ("cisco" in str(v).lower()):
+                return True
+        return False
+
+
+def _extract_cert_from_record(rec: dict) -> str | None:
+    """
+    Toma el valor del campo 'certificacion' (si está presente y no es vacío/ninguno).
+    """
+    raw = (rec.get("certificacion") or "").strip()
+    if not raw:
+        return None
+    # descarta valores triviales
+    if raw.lower() in {"ninguna", "na", "none", "sin certificación", "sin certificacion"}:
+        return None
+    return raw
+
+def _extract_exam_from_record(rec: dict) -> str | None:
+    """
+    Toma el valor del campo 'clave_examen' (si no está vacío).
+    """
+    raw = (rec.get("clave_examen") or "").strip()
+    if not raw:
+        return None
+    return raw
+
+# (opcional) alias semántico; reutiliza la lógica existente
+def _norm_exam_key(s: str) -> str:
+    return _norm_cert_key(s)
+
+def _norm_cert_key(s: str) -> str:
+    """
+    Normaliza para matching flexible:
+    - minúsculas
+    - elimina paréntesis y su contenido: (Digital), (v1.3), etc.
+    - deja solo [a-z0-9] y espacios colapsados
+    """
+    if not s:
+        return ""
+    s = s.lower()
+    s = re.sub(r"\(.*?\)", "", s)
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _extract_json_obj(raw: str) -> dict:
+    """
+    Intenta extraer un objeto JSON desde 'raw' aunque haya texto extra,
+    fences ```json, o varios bloques. Devuelve un dict (o dict con 'items').
+    """
+    raw = raw or ""
+    # 1) directo
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+
+    # 2) bloque ```json ... ```
+    m = re.search(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", raw, flags=re.S | re.I)
+    if m:
+        block = m.group(1)
+        try:
+            obj = json.loads(block)
+            return obj if isinstance(obj, dict) else {"items": obj}
+        except Exception:
+            pass
+
+    # 3) primer objeto balanceado {...}
+    start = raw.find("{")
+    if start != -1:
+        depth = 0
+        for i, ch in enumerate(raw[start:], start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = raw[start:i+1]
+                    try:
+                        return json.loads(candidate)
+                    except Exception:
+                        break
+
+    # 4) o un array raíz [...]
+    m = re.search(r"\[\s*\{.*?\}\s*\]", raw, flags=re.S)
+    if m:
+        try:
+            return {"items": json.loads(m.group(0))}
+        except Exception:
+            pass
+
+    raise ValueError("No se encontró JSON válido en la salida del modelo")
+
+def _fetch_cisco_cert_summaries_batch_exact(displays: list[str]) -> dict[str, str]:
+    """
+    UNA sola llamada → { display_exacto: resumen }.
+    Se fuerza alineación por índice (id) y se exige devolver EXACTAMENTE un item por cada display.
+    Si no hay info en los enlaces, el modelo debe marcar found=false y dejar resumen="".
+    Solo enriquecemos los found=true, SIN llamadas extra.
+    """
+    try:
+        api_key = os.getenv("OPENAI_API_KEY")
+        org = os.getenv("OPENAI_API_ORGANIZATION")
+        if not api_key:
+            print("[WARN] No OPENAI_API_KEY en entorno; omitiendo enriquecimiento Cisco.")
+            return {}
+
+        displays = [ (d or "").strip() for d in displays if (d or "").strip() ]
+        if not displays:
+            return {}
+
+        client = OpenAIClient(api_key=api_key, organization=org)
+
+        system_msg = (
+            "Lee EXCLUSIVAMENTE estos enlaces oficiales de Cisco. "
+            "Responde en español y devuelve SOLO JSON válido (sin texto adicional). "
+            "Si el examen está en retired.html, toma **exactamente** el valor de la columna “Last day to test”. "
+            "Si está en list.html, toma **exactamente** el valor de la columna “Languages”. "
+            "No inventes ni reformules valores; usa las celdas tal cual. "
+            "Enlaces permitidos:\n"
+            "1) https://www.cisco.com/site/us/en/learn/training-certifications/exams/retired.html\n"
+            "2) https://www.cisco.com/site/us/en/learn/training-certifications/exams/list.html\n"
+        )
+
+        # Esquema con id + found
+        json_schema_str = """{
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                "id": { "type": "integer" },
+                "clave_examen": { "type": "string" },
+                "resumen": { "type": "string" },
+                "found": { "type": "boolean" }
+                },
+                "required": ["id", "clave_examen", "resumen", "found"]
+            }
+            }
+        },
+        "required": ["items"]
+        }"""
+
+        # Enumeramos 1..N y obligamos un item por cada línea
+        id2display = {i+1: d for i, d in enumerate(displays)}
+        # Etiquetamos la lista como EXAM
+        items_block = "\n".join(f'- [{i}] EXAM: "{d}"' for i, d in id2display.items())
+
+        user_prompt = (
+            "Devuelve ÚNICAMENTE un JSON que cumpla este esquema (sin markdown alrededor):\n"
+            f"{json_schema_str}\n\n"
+            "Genera **EXACTAMENTE UN** item por cada línea enumerada que te doy abajo, conservando el mismo id. "
+            'Para cada item:\n'
+            '- "clave_examen": EXACTAMENTE el texto provisto (sin cambios)\n'
+            '- "resumen":\n'
+            '   • Si lo encuentras en retired.html → "No vigente - Last day to test: <fecha>"\n'
+            '   • Si lo encuentras en list.html    → "Vigente - Languages: <valor>"\n'
+            '   (Usa los valores **tal cual** aparecen en la tabla de la página correspondiente.)\n'
+            '- "found": true solo si pudiste obtener la info de **al menos uno** de los dos enlaces anteriores; en caso contrario, '
+            '  "found": false y deja "resumen"="" (cadena vacía).\n'
+            "No agregues ni quites items y no mezcles columnas entre páginas.\n\n"
+            "LISTA:\n"
+            f"{items_block}"
+        )
+
+        resp = client.responses.create(
+            model=OPENAI_RESPONSES_MODEL,
+            input=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_prompt},
+            ],
+            tools=[{"type": "web_search"}]  # sin temperature/response_format en tu SDK
+        )
+
+        raw = getattr(resp, "output_text", "") or ""
+        try:
+            data = _extract_json_obj(raw)
+        except Exception as e:
+            print(f"[Cisco] JSON inválido: {e}. Raw (primeros 400): {raw[:400]!r}")
+            return {}
+
+
+        # Reconstruir por id (corrigiendo el nombre si el modelo lo alteró)
+        result = {}
+        missing_ids = set(id2display.keys())
+        for it in (data or {}).get("items", []):
+            _id = it.get("id")
+            disp_req = id2display.get(_id)
+            if not disp_req:
+                continue
+
+            # Forzar display exacto (aunque el modelo lo cambie)
+            disp = disp_req
+            found = bool(it.get("found"))
+            summ = (it.get("resumen") or "").strip()
+
+            # Guarda solo los que found=true con resumen
+            if found and summ:
+                # recorte de seguridad
+                words = summ.split()
+                if len(words) > 70:
+                    summ = " ".join(words[:70])
+                result[disp] = summ
+
+            if _id in missing_ids:
+                missing_ids.remove(_id)
+
+        # Log de cobertura (sin llamadas extra)
+        if missing_ids:
+            print(f"ℹ️ El modelo no devolvió {len(missing_ids)} item(s) pese a la instrucción de uno-por-línea: {sorted(missing_ids)}")
+        # También registra los que declaró found=false
+        skipped = [d for d in displays if d not in result]
+        if skipped:
+            print(f"ℹ️ Sin información suficiente (found=false) para: {', '.join(skipped)}")
+
+        return result
+    except Exception as e:
+        print(f"[Cisco] Error en batch-exact: {e}")
+        return {}
 
 # =========================
 # Carga a Milvus (opcional)
@@ -573,7 +818,7 @@ def main():
                         choices=list(QUERIES.keys()) + ["temarios", "all"],
                         default="all",
                         help="Qué exportar: 'cursos', 'temarios' o 'all'")
-    parser.add_argument("--output-dir", default=".", help="Directorio de salida (por defecto: .)")
+    parser.add_argument("--output-dir", default="./salida", help="Directorio de salida (por defecto: .)")
 
     # Flags Milvus
     parser.add_argument("--milvus-load", action="store_true",
@@ -606,7 +851,57 @@ def main():
             processed.append(normalize_link_only(rec))
         cursos_cache = processed
         out = os.path.join(args.output_dir, "cursos.json")
+        # -------- Enriquecimiento: certificaciones Cisco (EXACTO, usando clave_examen) --------
+        # 1) Filtra cursos Cisco
+        cisco_rows = [r for r in processed if _is_cisco_record(r)]
+
+        # 2) Toma SOLO el valor EXÁCTO del campo 'clave_examen' y deduplica
+        display_set = set()
+        for r in cisco_rows:
+            disp = _extract_exam_from_record(r)  # <--- antes usaba _extract_cert_from_record
+            if disp:
+                display_set.add(disp)
+
+        cert_map = {}
+        if display_set:
+            print(f"🔎 Consultando certificaciones Cisco (exámenes únicos: {len(display_set)})…")
+            # Llamada única que devuelve { clave_examen_exacto: resumen } SOLO para found=true
+            cert_map = _fetch_cisco_cert_summaries_batch_exact(sorted(display_set))
+
+            # Normalizados para comparar de forma robusta
+            norm_map = {_norm_exam_key(k): v for k, v in cert_map.items()}
+            norm_displays = {_norm_exam_key(d) for d in display_set}
+
+            # 👉 Enriquecer cursos.json:
+            #    - Si hay resumen -> lo usa
+            #    - Si NO hay resumen pero el display es Cisco -> "Consultar con Preventa"
+            for r in processed:
+                display = (r.get("clave_examen") or "").strip()   # <--- ahora sobre clave_examen
+                if not display:
+                    continue
+                k = _norm_exam_key(display)
+                if k in norm_displays:  # solo aplica a exámenes Cisco detectados
+                    resumen = norm_map.get(k)
+                    r["clave_examen"] = (
+                        f"{display} - {resumen}" if resumen else f"{display} - Consultar con Preventa"
+                    )
+
+            # 👉 examenes.json con TODOS los exámenes (paridad 1:1 con cursos),
+            #    usando "Consultar con Preventa" para los no hallados (found=false)
+            all_displays = sorted(display_set)
+            cert_list = [
+                {"clave_examen": d, "resumen": cert_map.get(d, "Consultar con Preventa")}
+                for d in all_displays
+            ]
+            write_json(cert_list, os.path.join(args.output_dir, "examenes.json"))
+            print(f"✅ examenes.json generado con {len(all_displays)} ítems (clave_examen + 'Consultar con Preventa' para no hallados)")
+        else:
+            print("ℹ️ No hay exámenes Cisco (clave_examen) para consultar certificaciones.")
+
+
+        # --- (final) SIEMPRE escribir cursos.json (con o sin enriquecimiento) ---
         write_json(processed, out)
+        print(f"✅ cursos.json generado con {len(processed)} cursos")
 
     def export_temarios():
         """
@@ -666,4 +961,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
